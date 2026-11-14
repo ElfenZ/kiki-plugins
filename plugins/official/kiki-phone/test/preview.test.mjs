@@ -196,6 +196,42 @@ test('preview service supports Android + iOS discovery, frame streaming, normali
   }
 });
 
+test('E5 and E12 describe use fast bounded state cache without blocking on hung probes', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'kiki-phone-fast-slot-'));
+  let calls = 0;
+  const preview = createPhonePreviewService({
+    dataDir,
+    hostPlatform: 'win32',
+    loadDriverModule: async () => ({
+      MobilecliDriver: class SlowDriver {
+        async listDevices() {
+          calls += 1;
+          if (calls === 1) {
+            return [{ id: 'SERIAL-FAST', name: 'Pixel 9', platform: 'android', type: 'real', state: 'online', screenWidth: 1080, screenHeight: 2400 }];
+          }
+          await new Promise((r) => setTimeout(r, 4000));
+          return [];
+        }
+        async dispose() {}
+      },
+    }),
+    executeFile: async () => ({ stdout: 'List of devices attached\n', stderr: '' }),
+  });
+  try {
+    const slots = createPhoneSlotHandlers(preview);
+    const first = await slots['E5:prompt-context']({});
+    assert.equal(first.sections.length, 1);
+    assert.equal(calls, 1);
+
+    const cached = await slots['E12:server-gui-slots']({ kind: 'describe' });
+    assert.equal(calls, 1);
+    assert.ok(cached.guiSlots.some((s) => s.slot === 'status-capsule' && s.label.default === 'Pixel 9'));
+  } finally {
+    await preview.dispose();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('panel.html stays within the Kiki 256 KiB single-file srcDoc limit, speaks the canonical kiki.panel.v1 host envelope, and carries no emoji', async () => {
   const html = await readFile(new URL('../panel.html', import.meta.url), 'utf8');
   assert.ok(Buffer.byteLength(html, 'utf8') < 256 * 1024);

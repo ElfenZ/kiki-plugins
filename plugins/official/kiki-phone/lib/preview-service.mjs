@@ -225,11 +225,24 @@ export function createPhonePreviewService({
     return entry;
   }
 
-  async function discoverSimulatorsDarwin() {
+  const FAST_STATE_TTL_MS = 15_000;
+  const FAST_PROBE_TIMEOUT_MS = 1_500;
+  let cachedProbe = { key: '', at: 0, allDevices: null, diagnostics: null };
+
+  function raceTimeout(promise, ms, message) {
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+      timer.unref?.();
+    });
+    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+  }
+
+  async function discoverSimulatorsDarwin(timeoutMs = 8_000) {
     if (hostPlatform !== 'darwin') return { available: false, reason: 'Xcode iOS Simulator requires macOS; physical iOS devices can connect via mobilecli / USB bridge.', devices: [] };
     try {
       const { stdout } = await executeFile('xcrun', ['simctl', 'list', 'devices', 'available', '-j'], {
-        encoding: 'utf8', timeout: 8_000, windowsHide: true,
+        encoding: 'utf8', timeout: timeoutMs, windowsHide: true,
       });
       const parsed = JSON.parse(stdout || '{}');
       const sims = [];
@@ -257,63 +270,86 @@ export function createPhonePreviewService({
     }
   }
 
-  async function listState({ settings = {} } = {}) {
+  async function listState({ settings = {}, fast = false } = {}) {
     const dataDir = resolveDataDir();
-    const hasRuntime = loadDriverModule ? true : await runtimeInstalled(dataDir);
-    const adbBinary = settings?.adbPath || await findAdb({ dataDir }).catch(() => undefined);
-    const env = upstreamEnvironment(adbBinary, process.env, dataDir);
+    const cacheKey = String(settings?.adbPath ?? '');
+    let allDevices;
+    let diagnostics;
 
-    const byKey = new Map();
-    const diagnostics = {
-      runtimeInstalled: hasRuntime,
-      hostPlatform,
-      android: { available: Boolean(adbBinary), adbPath: adbBinary ?? null, reason: adbBinary ? null : 'ADB not configured. Run phone_prepare to configure official platform-tools.' },
-      ios: {
-        available: hasRuntime,
-        simulatorsSupported: hostPlatform === 'darwin',
-        reason: hostPlatform === 'darwin'
-          ? null
-          : 'iOS Simulator requires macOS; physical iPhone/iPad connects via USB + signed DeviceKit agent.',
-      },
-    };
+    if (fast && cachedProbe.allDevices && cachedProbe.key === cacheKey && Date.now() - cachedProbe.at < FAST_STATE_TTL_MS) {
+      allDevices = cachedProbe.allDevices;
+      diagnostics = cachedProbe.diagnostics;
+    } else {
+      const hasRuntime = loadDriverModule ? true : await runtimeInstalled(dataDir);
+      const adbBinary = settings?.adbPath || await findAdb({ dataDir }).catch(() => undefined);
+      const env = upstreamEnvironment(adbBinary, process.env, dataDir);
 
-    if (hasRuntime) {
-      try {
+      const byKey = new Map();
+      diagnostics = {
+        runtimeInstalled: hasRuntime,
+        hostPlatform,
+        android: { available: Boolean(adbBinary), adbPath: adbBinary ?? null, reason: adbBinary ? null : 'ADB not configured. Run phone_prepare to configure official platform-tools.' },
+        ios: {
+          available: hasRuntime,
+          simulatorsSupported: hostPlatform === 'darwin',
+          reason: hostPlatform === 'darwin'
+            ? null
+            : 'iOS Simulator requires macOS; physical iPhone/iPad connects via USB + signed DeviceKit agent.',
+        },
+      };
+
+      const mobilecliTimeout = fast ? FAST_PROBE_TIMEOUT_MS : 10_000;
+      const adbTimeout = fast ? FAST_PROBE_TIMEOUT_MS : 8_000;
+      const simTimeout = fast ? FAST_PROBE_TIMEOUT_MS : 8_000;
+
+      const probeMobilecli = async () => {
+        if (!hasRuntime) return [];
         if (loadDriverModule) {
-          const { MobilecliDriver } = await resolveDriverClass(dataDir, adbBinary);
-          const probe = new MobilecliDriver({ mobilecliPath: await mobilecliBinary(dataDir) });
-          try {
-            const list = await probe.listDevices({ includeOffline: true });
-            for (const item of list || []) {
-              const norm = normalizeDeviceRecord(item, item.platform || 'android');
-              byKey.set(`${norm.platform}:${norm.id}`, norm);
+          const runDriverProbe = async () => {
+            const { MobilecliDriver } = await resolveDriverClass(dataDir, adbBinary);
+            const probe = new MobilecliDriver({ mobilecliPath: await mobilecliBinary(dataDir) });
+            try {
+              const list = await probe.listDevices({ includeOffline: true });
+              return (list || []).map((item) => normalizeDeviceRecord(item, item.platform || 'android'));
+            } finally {
+              await probe.dispose?.().catch(() => {});
             }
-          } finally {
-            await probe.dispose?.().catch(() => {});
-          }
-        } else {
-          const cli = await mobilecliBinary(dataDir);
-          const { stdout } = await executeFile(cli, ['devices', '--include-offline'], {
-            encoding: 'utf8', env, windowsHide: true, timeout: 10_000,
-          });
-          const parsed = JSON.parse(stdout || '{}');
-          const list = Array.isArray(parsed) ? parsed : (parsed.data?.devices || parsed.devices || []);
-          for (const item of list) {
-            const norm = normalizeDeviceRecord(item, item.platform || 'android');
-            byKey.set(`${norm.platform}:${norm.id}`, norm);
-          }
+          };
+          return fast ? raceTimeout(runDriverProbe(), mobilecliTimeout, 'mobilecli fast probe timed out') : runDriverProbe();
         }
-      } catch (error) {
-        diagnostics.mobilecliError = error.message || String(error);
-      }
-    }
-
-    if (adbBinary) {
-      try {
-        const { stdout } = await executeFile(adbBinary, ['devices', '-l'], {
-          encoding: 'utf8', env, windowsHide: true, timeout: 8_000,
+        const cli = await mobilecliBinary(dataDir);
+        const { stdout } = await executeFile(cli, ['devices', '--include-offline'], {
+          encoding: 'utf8', env, windowsHide: true, timeout: mobilecliTimeout,
         });
-        for (const row of parseDevices(stdout)) {
+        const parsed = JSON.parse(stdout || '{}');
+        const list = Array.isArray(parsed) ? parsed : (parsed.data?.devices || parsed.devices || []);
+        return list.map((item) => normalizeDeviceRecord(item, item.platform || 'android'));
+      };
+
+      const probeAdb = async () => {
+        if (!adbBinary) return [];
+        const { stdout } = await executeFile(adbBinary, ['devices', '-l'], {
+          encoding: 'utf8', env, windowsHide: true, timeout: adbTimeout,
+        });
+        return parseDevices(stdout);
+      };
+
+      const [mobilecliOutcome, adbOutcome, simOutcome] = await Promise.all([
+        probeMobilecli().then((items) => ({ ok: true, items }), (error) => ({ ok: false, error })),
+        probeAdb().then((rows) => ({ ok: true, rows }), (error) => ({ ok: false, error })),
+        hostPlatform === 'darwin' ? discoverSimulatorsDarwin(simTimeout) : Promise.resolve(null),
+      ]);
+
+      if (mobilecliOutcome.ok) {
+        for (const norm of mobilecliOutcome.items) {
+          byKey.set(`${norm.platform}:${norm.id}`, norm);
+        }
+      } else {
+        diagnostics.mobilecliError = mobilecliOutcome.error?.message || String(mobilecliOutcome.error);
+      }
+
+      if (adbOutcome.ok) {
+        for (const row of adbOutcome.rows) {
           const key = `android:${row.serial}`;
           if (!byKey.has(key)) {
             const modelMatch = row.details.match(/\bmodel:([^\s]+)/);
@@ -330,22 +366,23 @@ export function createPhonePreviewService({
             byKey.get(key).state = 'unauthorized';
           }
         }
-      } catch (error) {
-        diagnostics.android.reason = error.message || String(error);
+      } else if (adbBinary) {
+        diagnostics.android.reason = adbOutcome.error?.message || String(adbOutcome.error);
       }
+
+      if (simOutcome) {
+        diagnostics.ios.available = diagnostics.ios.available || simOutcome.available;
+        if (!simOutcome.available && simOutcome.reason) diagnostics.ios.reason = simOutcome.reason;
+        for (const item of simOutcome.devices) {
+          const key = `ios:${item.id}`;
+          if (!byKey.has(key)) byKey.set(key, item);
+        }
+      }
+
+      allDevices = sortDevices([...byKey.values()]);
+      cachedProbe = { key: cacheKey, at: Date.now(), allDevices, diagnostics };
     }
 
-    if (hostPlatform === 'darwin') {
-      const sim = await discoverSimulatorsDarwin();
-      diagnostics.ios.available = diagnostics.ios.available || sim.available;
-      if (!sim.available && sim.reason) diagnostics.ios.reason = sim.reason;
-      for (const item of sim.devices) {
-        const key = `ios:${item.id}`;
-        if (!byKey.has(key)) byKey.set(key, item);
-      }
-    }
-
-    const allDevices = sortDevices([...byKey.values()]);
     const saved = await readSelectedDevice(dataDir);
     const online = allDevices.filter((d) => d.state === 'online');
     let selected = saved && allDevices.some((d) => d.id === saved.id && d.platform === saved.platform)

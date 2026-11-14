@@ -144,7 +144,7 @@ export function createPhoneSlotHandlers(previewService, { pluginId = KIKI_PHONE_
   return {
     async 'E5:prompt-context'(payload = {}, context = {}) {
       try {
-        const state = await previewService.listState({ settings: context.settings ?? payload?.settings ?? {} });
+        const state = await previewService.listState({ settings: context.settings ?? payload?.settings ?? {}, fast: true });
         const online = state.devices.filter((d) => d.state === 'online');
         if (online.length === 0) return { sections: [] };
         const summary = online
@@ -175,7 +175,7 @@ export function createPhoneSlotHandlers(previewService, { pluginId = KIKI_PHONE_
       if (kind === 'describe') {
         let liveSummary = null;
         try {
-          liveSummary = await previewService.listState({ settings });
+          liveSummary = await previewService.listState({ settings, fast: true });
         } catch {}
         return {
           guiSlots: buildPhoneGuiSlots(pluginId, liveSummary),

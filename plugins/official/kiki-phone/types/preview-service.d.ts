@@ -48,7 +48,7 @@ export function createPhonePreviewService(options?: {
   executeFile?: (...args: unknown[]) => Promise<{ stdout: string; stderr: string }>;
   loadDriverModule?: (ctx: { dataDir: string; adbBinary?: string }) => Promise<unknown>;
 }): {
-  listState(options?: { settings?: Record<string, unknown> }): Promise<Record<string, unknown>>;
+  listState(options?: { settings?: Record<string, unknown>; fast?: boolean }): Promise<Record<string, unknown>>;
   captureFrame(options?: Record<string, unknown>): Promise<Record<string, unknown>>;
   inspectHierarchy(options?: Record<string, unknown>): Promise<Record<string, unknown>>;
   performAction(input?: Record<string, unknown>, options?: { settings?: Record<string, unknown> }): Promise<Record<string, unknown>>;
